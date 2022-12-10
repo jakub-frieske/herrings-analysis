@@ -1,0 +1,658 @@
+---
+title: "Analiza stopniowego karłowacenia śledzi oceanicznych wyławianych w&nbsp;Europie"
+author: "Jakub Frieske"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: yes
+    toc_float: yes
+    number_sections: yes
+    df_print: paged
+    highlight: pygments
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,  warning=FALSE, message=FALSE, fig.align="center")
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+library(DT)
+prettyTable <- function(table_df, round_digits=2, show_entries=10) {
+    DT::datatable(table_df, style="bootstrap", filter = "none", rownames = FALSE, 
+                  extensions = c('Buttons'), 
+                  options = list(
+                    pageLength = show_entries,
+                    scrollX = TRUE,  
+                    dom = 'Bfrtip',  autoWidth = T,
+                    buttons = list('copy', 'csv', 'excel', list(extend='pdf', orientation='landscape', pageSize='A2'),  'print')
+                    )) %>% formatRound(names(dplyr::select_if(table_df, is.numeric)), round_digits) 
+}
+
+```
+
+```{r install_package, include=FALSE}
+devtools::install_github("kassambara/ggcorrplot")
+devtools::install_github("ropensci/skimr")
+```
+
+# Streszczenie (Executive summary)
+
+Na przestrzeni ostatnich 60 lat da się zauważyć stopniowe karłowacenie śledzi oceanicznych wyławianych w Europie. Analiza danych była procesem wieloetapowym. Z powodu brakujących wartości konieczne okazało się wypełnienie ich przed przejściem do kolejnego etapu.
+Do ich zastąpienia została wykorzystana średnia wartość ze zbioru pogrupowanych parametrów. W&nbsp;kolejnym etapie przeprowadzona została analiza podstawowych statystyk, a także rozkładu wartości atrybutów i korelacji między nimi. W&nbsp;ostatnim etapie stworzony został regresor przewidujący rozmiar śledzia.
+
+Podczas przeprowadzania analizy zauważono silny wpływ temperatury przy powierzchni wody `sst` na długość łowionych śledzi `length` (im wyższa temperatura, tym śledź był mniejszy). 
+
+Kolejnymi prametrami, które mogą wpływać na długość są:
+
+- natężenie połowów `fbar`,
+- łączna liczba ryb złowionych w&nbsp;ramach połowu `totaln`,
+- roczny narybek `recr`.
+
+Przyczyną tego mogą być działania ludzi, czyli zwiększenie liczby wyławianych śledzi, co spowodowało opóźnienie ich rozwoju.
+
+# Wstęp
+
+Celem projektu jest określenie jakie mogą być główne przyczyny stopniowego karłowacenia śledzi oceanicznych wyławianych w&nbsp;Europie. Dane do analizy zawierają pomiary śledzi i warunków w&nbsp;jakich żyją z ostatnich 60 lat, były one pobierane z połowów komercyjnych jednostek. W&nbsp;ramach połowu jednej jednostki losowo wybierano od 50 do 100 sztuk trzyletnich śledzi. Dane są uporządkowane chronologicznie.
+
+Kolejne kolumny w&nbsp;zbiorze danych to:
+
+-   [**length**]{style="color:#ce4844"}: długość złowionego śledzia [cm];
+-   **cfin1**: dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 1];
+-   **cfin2**: dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 2];
+-   **chel1**: dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 1];
+-   **chel2**: dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 2];
+-   **lcop1**: dostępność planktonu [zagęszczenie widłonogów gat. 1];
+-   **lcop2**: dostępność planktonu [zagęszczenie widłonogów gat. 2];
+-   **fbar**: natężenie połowów w&nbsp;regionie [ułamek pozostawionego narybku];
+-   **recr**: roczny narybek [liczba śledzi];
+-   **cumf**: łączne roczne natężenie połowów w&nbsp;regionie [ułamek pozostawionego narybku];
+-   **totaln**: łączna liczba ryb złowionych w&nbsp;ramach połowu [liczba śledzi];
+-   **sst**: temperatura przy powierzchni wody [°C];
+-   **sal**: poziom zasolenia wody [Knudsen ppt];
+-   **xmonth**: miesiąc połowu [numer miesiąca];
+-   **nao**: oscylacja północnoatlantycka [mb].
+
+# Wstępne przetwarzanie
+
+W tej części następuje załadowanie wykorzystanych w&nbsp;projekcie bibliotek, zapewnienie powtarzalności wyników, wczytywanie danych i wstępne przygotowanie danych.
+
+## Wykorzystanie biblioteki
+
+```{r libs}
+library(dplyr) 
+library(tidyr) 
+library(skimr) 
+library(ggplot2)
+library(plotly) 
+library(ggcorrplot) 
+library(caret) 
+```
+
+## Powtarzalność wyników
+
+```{r set_seed}
+set.seed(23)
+```
+
+## Wczytywanie danych
+
+Wartości puste w&nbsp;zbiorze danych oznaczone są znakiem '?', przy wczytywaniu, korzystając z parametru `na.string`, zostaną zastąpione wartością `NA`.
+
+```{r read_data}
+df <- read.csv('sledzie.csv', na.string='?')
+head(df)
+dim(df)
+```
+
+Zbiór danych zawiera 52582 obserwacji opisanych 16 cechami.
+
+## Przetwarzanie brakujących danych
+
+```{r missing_data, echo=FALSE}
+df %>% 
+  summarise_all(list(~is.na(.))) %>%
+  pivot_longer(col=everything(), names_to = 'variable', values_to = 'missing') %>% 
+  group_by(variable) %>% mutate(total=n()) %>%
+  count(variable,total, missing) %>%
+  filter(n != total) %>%
+  mutate( percent = n/total) -> df_missing
+
+o<- df_missing %>% filter(missing == T) %>% arrange(-n) %>% pull(variable) 
+
+df_missing %>%
+  mutate(variable = factor(variable, levels = o)) %>%
+    ggplot(aes(
+      x=variable,
+      y=percent,
+      fill=missing)) + 
+    geom_bar(stat='identity', position = 'stack', alpha=0.8) +
+    ggtitle("Procent brakujących wartości") +
+    labs(x= "cecha", 
+         y = "% brakującyh wartości") +
+    scale_y_continuous(labels = scales::percent ) +
+    scale_fill_manual(name="", values = c('steelblue', 'tomato3'), labels = c('obecne','brakujące') ) +
+    geom_text(aes(label = paste0(n,' (', round(percent*100,0),'%)' )), position=position_stack(.6), size=3)+ theme_bw()+
+    theme(legend.position="bottom", legend.direction="horizontal") 
+```
+
+Z powyższego wykresu widać, że brakujące wartości występują w&nbsp;kolumnach, które opisują:
+
+-   dostępność planktonu (*cfin1*, *cfin2*, *chel1*, *chel2*, *lcop1*, *lcop2*),
+-   temperaturę przy powierzchni wody (*sst*).
+
+W przypadku odrzucenia tych pomiarów utracone zostanie zbyt dużo istotnych informacji. Można zauważyć, że dane te są silnie ze sobą powiązane (dla danego połowu przyjmują stałe wartości).
+
+```{r example_NA_data}
+df[200:215,]
+```
+
+Jak widać w&nbsp;powyższym zestawieniu, brakujące dane można zastąpić danymi z podobnych wierszy (obserwacji).
+
+```{r replace_missing_data}
+impute.mean <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE))
+
+df <- df %>%
+          group_by(recr, xmonth) %>%
+          mutate(
+             cfin1 = impute.mean(cfin1),
+             cfin2 = impute.mean(cfin2),
+             chel1 = impute.mean(chel1),
+             chel2 = impute.mean(chel2),
+             lcop1 = impute.mean(lcop1),
+             lcop2 = impute.mean(lcop2),
+             sst = impute.mean(sst) 
+          ) %>% ungroup()
+```
+
+# Opis danych
+W tej części następuje opisane głównych statystyk zbioru, dokonanie analizy wartości atrybutów oraz przedstawienie wykresu zagęszczenia planktonu w&nbsp;czasie.
+
+|                             |   Wartość    |
+|-----------------------------|:------------:|
+| Liczba kolumn (zmiennych)   | `r ncol(df)` |
+| Liczba wierszy (obserwacji) | `r nrow(df)` |
+
+```{r summary}
+prettyTable(skim(df), show_entries=16)
+```
+
+## Analiza wartości atrybutów {.tabset .tabset-pills}
+
+### length {-}
+
+Na poniższym wykresie można z łatwością zauważyć, że rozkład długości złowionego śledzia `length` przypomina rozkład normalny.
+
+```{r hist_length, echo = FALSE}
+ggplot(df, aes(length)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram długości')+
+      labs(x='długość', y='liczba obserwacji')
+
+desc <- summary(df$length)
+desc["SD"] <- round(sd(df$length),2) 
+desc
+```
+
+### cfin1 {-}
+
+Z wykresu wynika, że dostępność planktonu `cfin1` była zdecydowanie niska.
+
+```{r hist_cfin1, echo = FALSE}
+ggplot(df, aes(cfin1)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram cfin1')+
+      labs(x='cfin1', y='liczba obserwacji')
+
+desc <- summary(df$cfin1)
+desc["SD"] <- round(sd(df$cfin1),2) 
+desc
+```
+
+
+### cfin2 {-}
+
+Podobnie jak w&nbsp;przypadku `cfin1`, rozkład `cfin2` jest zdominowany przez niskie wartości, jednak w&nbsp;znacznie mniejszym stopniu.
+
+
+```{r hist_cfin2, echo = FALSE}
+ggplot(df, aes(cfin2)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram cfin2')+
+      labs(x='cfin2', y='liczba obserwacji')
+
+
+desc <- summary(df$cfin2)
+desc["SD"] <- round(sd(df$cfin2),2) 
+desc
+```
+
+
+### chel1 {-}
+
+Podobnie jak w&nbsp;poprzednich cechach można zauważyć niską dostępność planktonu `chel1`.
+
+
+```{r hist_chel1, echo = FALSE}
+ggplot(df, aes(chel1)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram chel1')+
+      labs(x='chel1', y='liczba obserwacji')
+
+
+desc <- summary(df$chel1)
+desc["SD"] <- round(sd(df$chel1),2) 
+desc
+```
+
+
+### chel2 {-}
+
+Można zauważyć, że rozkład dostępności planktonu `chel2` jest zróżnicowany.
+
+```{r hist_chel2, echo = FALSE}
+ggplot(df, aes(chel2)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram chel2')+
+      labs(x='chel2', y='liczba obserwacji')
+
+
+desc <- summary(df$chel2)
+desc["SD"] <- round(sd(df$chel2),2) 
+desc
+```
+
+
+### lcop1 {-}
+
+Można zauważyć, że rozkład dostępności planktonu `lcop1` jest zróżnicowany.
+
+
+```{r hist_lcop1, echo = FALSE}
+ggplot(df, aes(lcop1)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram lcop1')+
+      labs(x='lcop1', y='liczba obserwacji')
+
+
+desc <- summary(df$lcop1)
+desc["SD"] <- round(sd(df$lcop1),2) 
+desc
+```
+
+
+### lcop2 {-}
+
+Widać, że rozkład dostępności planktonu `lcop2` jest zróżnicowany.
+
+
+```{r hist_lcop2, echo = FALSE}
+ggplot(df, aes(lcop2)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram lcop2')+
+      labs(x='lcop2', y='liczba obserwacji')
+
+
+desc <- summary(df$lcop2)
+desc["SD"] <- round(sd(df$lcop2),2) 
+desc
+```
+
+
+### fbar {-}
+
+Widać, że rozkład natężenia połowów w&nbsp;regionie `fbar` jest zróżnicowany.
+
+```{r hist_fbar, echo = FALSE}
+ggplot(df, aes(fbar)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram fbar')+
+      labs(x='fbar', y='liczba obserwacji')
+
+
+desc <- summary(df$fbar)
+desc["SD"] <- round(sd(df$fbar),2) 
+desc
+```
+
+### recr {-}
+
+Widać, że rozkład rocznego narybeku `recr` jest zróżnicowany.
+
+
+```{r hist_recr, echo = FALSE}
+ggplot(df, aes(recr)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram recr')+
+      labs(x='recr', y='liczba obserwacji')
+
+
+desc <- summary(df$recr)
+desc["SD"] <- round(sd(df$recr),2) 
+desc
+```
+
+### cumf {-}
+
+Widać, że rozkład łącznego roczne natężenia połowów w&nbsp;regionie `cumf` jest zróżnicowany.
+
+
+```{r hist_cumf, echo = FALSE}
+ggplot(df, aes(cumf)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram cumf')+
+      labs(x='cumf', y='liczba obserwacji')
+
+
+desc <- summary(df$cumf)
+desc["SD"] <- round(sd(df$cumf),2) 
+desc
+```
+
+### totaln {-}
+
+Widać, że rozkład łącznej liczby ryb złowionych w&nbsp;ramach połowu `totaln` jest zróżnicowany.
+
+
+```{r hist_totaln, echo = FALSE}
+ggplot(df, aes(totaln)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram totaln')+
+      labs(x='totaln', y='liczba obserwacji')
+
+
+desc <- summary(df$totaln)
+desc["SD"] <- round(sd(df$totaln),2) 
+desc
+```
+
+### sst {-}
+
+Widać, że rozkład temperatury przy powierzchni wody `sst` jest zróżnicowany.
+
+
+```{r hist_sst, echo = FALSE}
+ggplot(df, aes(sst)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram sst')+
+      labs(x='sst', y='liczba obserwacji')
+
+
+desc <- summary(df$sst)
+desc["SD"] <- round(sd(df$sst),2) 
+desc
+```
+
+### sal {-}
+
+Widać, że rozkład poziomu zasolenia wody `sal` jest zróżnicowany.
+
+
+```{r hist_sal, echo = FALSE}
+ggplot(df, aes(sal)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram sal')+
+      labs(x='sal', y='liczba obserwacji')
+
+
+desc <- summary(df$sal)
+desc["SD"] <- round(sd(df$sal),2) 
+desc
+```
+
+### xmonth {-}
+
+Z wykresu można odczytać, że większość obserwacji pochodzi z okresu letnio-jesiennego (lipiec, sierpień, wrzesień, październik).
+ 
+```{r hist_xmonth, echo = FALSE}
+ggplot(df, aes(xmonth)) + 
+      geom_histogram(color="black", fill = 'steelblue', binwidth=0.5) + theme_bw() +
+      scale_x_continuous(breaks = 1:12) +
+      ggtitle('Histogram xmonth') +
+      labs(x='xmonth', y='liczba obserwacji')
+
+
+desc <- summary(df$xmonth)
+desc["SD"] <- round(sd(df$xmonth),2) 
+desc
+```
+
+### nao {-}
+
+Widać, że rozkład oscylacji północnoatlantyckiej `nao` jest zróżnicowany.
+
+
+```{r hist_nao, echo = FALSE}
+ggplot(df, aes(nao)) + 
+      geom_histogram(color="black", fill = 'steelblue') + theme_bw() +
+      ggtitle('Histogram nao') +
+      labs(x='nao', y='liczba obserwacji')
+
+
+desc <- summary(df$nao)
+desc["SD"] <- round(sd(df$nao),2) 
+desc
+```
+
+
+
+
+## Analiza dostępności planktonów w&nbsp;czasie
+```{r add_period, include=F}
+df %>% 
+    mutate(year = match(recr, unique(recr))) -> df_period 
+```
+Wykres przedstawia dostępność planktonów w&nbsp;czasie.
+
+
+```{r plot_plankton_density, echo=FALSE}
+df_period %>% select(year, cfin1:lcop2) %>% 
+  pivot_longer(col=-c(year), names_to = "plankton_name", values_to = "density") %>%
+  mutate(plankton_name = replace(plankton_name, plankton_name == "cfin1", "Calanus finmarchicus gat. 1 (cfin1)")) %>%
+  mutate(plankton_name = replace(plankton_name, plankton_name == "cfin2", "Calanus finmarchicus gat. 2 (cfin2)")) %>%
+  mutate(plankton_name = replace(plankton_name, plankton_name == "chel1", "Calanus helgolandicus gat. 1 (chel1)")) %>%
+  mutate(plankton_name = replace(plankton_name, plankton_name == "chel2", "Calanus helgolandicus gat. 2 (chel2)")) %>%
+  mutate(plankton_name = replace(plankton_name, plankton_name == "lcop1", "Widłonogi gat. 1 (lcop1)")) %>%
+  mutate(plankton_name = replace(plankton_name, plankton_name == "lcop2", "Widłonogi gat. 1 (lcop2)")) %>%
+    ggplot(aes(year, density, color=factor(plankton_name))) + geom_smooth(se=F) + theme_bw() +
+    scale_color_discrete(name="Nazwa planktonu") +
+    labs(title="Wykres zagęszczenia planktonu w czasie",
+         x="Czas",
+         y="Zagęszczenie planktonu") -> p
+
+ggplotly(p) %>%
+    config(modeBarButtons = list(list("hoverClosestCartesian"), list("hoverCompareCartesian"), list("toImage")))
+```
+
+# Analiza korelacji między zmiennymi
+W tej części następuje analiza korelacji między zmiennymi.
+
+```{r correlation,}
+corrMatrix <- round( cor(df %>% select(-X)), 2)
+ggcorrplot(round(corrMatrix,1), type = "lower", lab = TRUE)
+```
+
+Bardzo silne korelacje dodatnie:
+
+-   `1.0` między `chel1`, a `lcop1`,
+-   `0.9` między `chel2`, a `lcop2`.
+
+Silne korelacje dodatnie:
+
+-   `0.8` między `fbar`, a `cumf` (oba parametry opisują natężenie połowów w&nbsp;regionie)
+-   `0.7` między `cfin2`, a `lcop2` 
+
+Silna korelacja ujemna:
+
+-   `-0.7` między `totaln`, a `cumf` (parametry opisują liczbę złowionych śledzi i ułamek pozostawionego narybku)
+
+Do oszacowania długości śledzia `length` istotny wydaje się być parametr temperatury przy powierzchni wody `sst`, oraz w&nbsp;mniejszym stopniu parametry: oscylacja północnoatlantycka  `nao`, zagęszczenie Calanus helgolandicus gat. 1 `chel1`, zagęszczenie widłonogów gat. 1 `lcop1` oraz ułamek pozostawionego narybku `fbar`. Zmienne te warto brać pod uwagę podczas analizy karłowacenia się śledzi.
+
+## Korelacja: {.tabset .tabset-pills}
+
+### length\~sst (`r corrMatrix["length", "sst"]`) {-}
+
+```{r length-sst, echo=FALSE}
+ggplot(df, aes(length, sst)) + 
+  geom_point() + 
+  geom_smooth(method="lm") + theme_bw()
+```
+
+### length\~nao (`r corrMatrix["length", "nao"]`) {-}
+
+```{r length-nao, echo=FALSE}
+ggplot(df, aes(length, nao)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+### length\~chel1 (`r corrMatrix["length", "chel1"]`) {-}
+
+```{r length-chel1, echo=FALSE}
+ggplot(df, aes(length, chel1)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+### length\~lcop1 (`r corrMatrix["length", "lcop1"]`) {-}
+
+```{r length-lcop1, echo=FALSE}
+ggplot(df, aes(length, lcop1)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+### length\~fbar (`r corrMatrix["length", "fbar"]`) {-}
+
+```{r length-fbar, echo=FALSE}
+ggplot(df, aes(length, fbar)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+### chel1\~lcop1 (`r corrMatrix["chel1", "lcop1"]`) {-}
+
+```{r chel1-lcop1, echo=FALSE}
+ggplot(df, aes(chel1, lcop1)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+### chel2\~lcop2 (`r corrMatrix["chel2", "lcop2"]`) {-}
+
+```{r chel2-lcop2, echo=FALSE}
+ggplot(df, aes(chel2, lcop2)) + 
+  geom_point() + 
+  geom_smooth(method="glm")  + theme_bw()
+```
+
+### fbar\~cumf (`r corrMatrix["fbar", "cumf"]`) {-}
+
+```{r fbar-cumf, echo=FALSE}
+ggplot(df, aes(fbar, cumf)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+### cfin2\~lcop2 (`r corrMatrix["cfin2", "lcop2"]`) {-}
+
+```{r cfin2-lcop2, echo=FALSE}
+ggplot(df, aes(cfin2, lcop2)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+### totaln\~cumf (`r corrMatrix["totaln", "cumf"]`) {-}
+
+```{r totaln-cumf, echo=FALSE}
+ggplot(df, aes(chel2, cumf)) + 
+  geom_point() + 
+  geom_smooth(method="glm") + theme_bw()
+```
+
+# Zmiana rozmiaru śledzi w&nbsp;czasie
+Wykres przedstawia zmianę rozmiaru złowionych śledzi na przestrzeni lat.
+
+```{r plot_lenght_time, echo=FALSE}
+df_period %>%
+  ggplot(aes(
+            x=year,
+            y=length
+        )) + 
+        geom_smooth(se=F) + theme_bw() + theme(legend.title = element_blank(), legend.position = 'center') +
+        labs(title="Wykres długości śledzia",
+             x= "Czas",
+             y= "Długość śledzia [cm]") -> p
+
+ggplotly(p)
+```
+
+# Przewidywanie rozmiaru śledzia
+W tej części zostanie zaproponowany przykładowy model do predykcji długości śledzia. Zbiór został podzielony na dane uczące, walidujące i testowe w&nbsp;proporcjach 14:3:3. 
+
+## Wyniki predykcji
+Do modelu został wykorzystany algorytm `Random Forest`, a najlepsze wyniki uzyskano dla modelu o parametrze `mtry = 4`.
+
+```{r trainging_model}
+inTrainging <- createDataPartition(df$length,
+                                   p = .7,
+                                   list = FALSE)
+
+training <- df[ inTrainging, ] %>% select(-c(X, xmonth))
+testing  <- df[-inTrainging, ] 
+
+ctrl <- trainControl(
+    method = "repeatedcv",
+    number = 2,
+    repeats = 5
+    )
+
+fit <- train(length ~ .,
+             data = training,
+             method = "rf",
+             trControl = ctrl,
+             tuneGrid = expand.grid(mtry = 4:4), 
+             ntree = 32
+             )
+fit
+knitr::kable(fit$results[,1:3], caption="Tabela wyników ze zbioru uczącego")
+```
+
+```{r predict_model}
+predictions <- predict(fit, newdata = testing %>% select(-c(X, xmonth)))
+result_predictions <- postResample(pred = predictions, obs=testing$length)
+knitr::kable(result_predictions[1:2], caption = "Tabela wyników ze zbioru testującego")
+```
+
+## Wykres przedstawiający porównanie wartości przewidzianych z rzeczywistymi
+```{r results_plot, echo=FALSE}
+results <- data.frame(id = testing$X , test_value = testing$length, prediction = predictions) 
+results %>%
+  pivot_longer(cols=-c(id), names_to = "source", values_to = "value" ) %>%
+  mutate(source = replace(source, source == "prediction", "Wartość przewidziana przez regresor")) %>%
+  mutate(source = replace(source, source == "test_value", "Wartość rzeczywista")) %>%
+  ggplot(aes(
+            x = id, 
+            y = value, 
+            color = source)) +
+          geom_smooth(alpha = 0.1) +
+          labs(
+            title = "Porównanie wartości przewidzianych z rzeczywistymi", 
+            x = "Numer połowu", 
+            y = "Długość śledzia [cm]") + 
+          theme(legend.title=element_blank()) +
+          theme_bw() -> results_plot
+
+ggplotly(results_plot)
+```
+
+## Analizę ważności atrybutów najlepszego znalezionego modelu regresji. 
+W tej części zostanie przedstawiona analiza ważności atrybutów modelu regresji.
+
+```{r important_feature}
+ggplotly( 
+  ggplot(varImp(fit)) + geom_col(fill = 'steelblue') + theme_minimal() + 
+  labs(y="Ważność", x="Cecha") )
+```
+
+Z wykresu wynika, że parametry: temperatura przy powierzchni wody `sst`, natężenie połowów&nbsp;`fbar`, łączna liczba ryb złowionych w&nbsp;ramach połowu `totaln` oraz roczny narybek `recr` zdecydowanie wyróżniają się od pozostałych parametrów. Zmiany temperatury mogą powodować zmiany w&nbsp;rozwoju planktonów, które mogą pogarszać warunki środowiska życia śledzi i&nbsp;ograniczać ich wzrost. Logiczne wydaje się, że jeśli zwiększymy liczbę wyławianych śledzi to z&nbsp;biegiem czasu doprowadzi do zmniejszenia ich populacji, co wiąże się ze zmniejszeniem ich rozwoju do czasu kolejnego połowu.
+
+
